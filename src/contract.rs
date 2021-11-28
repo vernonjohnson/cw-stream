@@ -54,59 +54,6 @@ pub fn execute(
     }
 }
 
-pub fn try_withdraw(
-    env: Env,
-    deps: DepsMut,
-    info: MessageInfo,
-    id: Uint128,
-) -> Result<Response, ContractError> {
-    let mut stream = STREAMS.load(deps.storage, id.u128().into())?;
-    if stream.recipient != info.sender {
-        return Err(ContractError::NotStreamRecipient {});
-    }
-
-    if stream.claimed_amount >= stream.amount {
-        return Err(ContractError::StreamFullyClaimed {});
-    }
-
-    if stream.claimed_amount >= stream.amount {
-        return Err(ContractError::StreamFullyClaimed {});
-    }
-
-    let block_time = env.block.time.nanos() / 1_000_000;
-    if stream.start_time < block_time {
-        return Err(ContractError::StreamNotStarted {});
-    }
-
-    let block_time = Uint128::from(block_time);
-    let start_time = Uint128::from(stream.start_time);
-    let end_time = Uint128::from(stream.end_time);
-
-    let claimable_amount = ((block_time - start_time) / (end_time - start_time) * stream.amount)
-        - stream.claimed_amount;
-    if claimable_amount < Uint128::new(0) {
-        return Err(ContractError::NoFundsToClaim {});
-    }
-
-    stream.claimed_amount += claimable_amount;
-    STREAMS.save(deps.storage, id.u128().into(), &stream)?;
-
-    let config = CONFIG.load(deps.storage)?;
-    let cw20 = Cw20Contract(config.cw20_addr);
-    let msg = cw20.call(Cw20ExecuteMsg::Transfer {
-        recipient: stream.recipient.to_string(),
-        amount: claimable_amount,
-    })?;
-
-    let res = Response::new()
-        .add_attribute("method", "withdraw")
-        .add_attribute("stream_id", id)
-        .add_attribute("amount", claimable_amount)
-        .add_attribute("recipient", stream.recipient.to_string())
-        .add_message(msg);
-    Ok(res)
-}
-
 pub fn try_create_stream(
     env: Env,
     deps: DepsMut,
@@ -116,20 +63,41 @@ pub fn try_create_stream(
     start_time: u64,
     end_time: u64,
 ) -> Result<Response, ContractError> {
+    let validated_owner = deps.api.addr_validate(owner.as_str())?;
+    if validated_owner != owner {
+        return Err(ContractError::InvalidOwner {});
+    }
+
+    let validated_recipient = deps.api.addr_validate(recipient.as_str())?;
+    if validated_recipient != recipient {
+        return Err(ContractError::InvalidRecipient {});
+    }
+
+    let config = CONFIG.load(deps.storage)?;
+    if config.owner == recipient {
+        return Err(ContractError::InvalidRecipient {});
+    }
+
     if start_time > end_time {
         return Err(ContractError::InvalidStartTime {});
     }
 
-    let block_time = env.block.time.nanos() / 1_000_000;
+    let block_time = env.block.time.seconds();
     if start_time < block_time {
         return Err(ContractError::InvalidStartTime {});
     }
 
-    let validated_owner = deps.api.addr_validate(owner.as_str())?;
-    assert_eq!(validated_owner, owner);
+    let duration: Uint128 = end_time.checked_sub(start_time).unwrap().into();
 
-    let validated_recipient = deps.api.addr_validate(recipient.as_str())?;
-    assert_eq!(validated_recipient, recipient);
+    if amount < duration {
+        return Err(ContractError::InvalidDuration {});
+    }
+
+    if amount.u128().checked_rem(duration.u128()).unwrap() != 0 {
+        return Err(ContractError::InvalidDuration {});
+    }
+
+    let rate_per_second: Uint128 = amount.u128().checked_div(duration.u128()).unwrap().into();
 
     let stream = Stream {
         owner: validated_owner,
@@ -138,8 +106,8 @@ pub fn try_create_stream(
         claimed_amount: Uint128::zero(),
         start_time,
         end_time,
+        rate_per_second,
     };
-
     save_stream(deps, &stream)?;
 
     Ok(Response::new()
@@ -180,6 +148,59 @@ pub fn execute_receive(
     }
 }
 
+pub fn try_withdraw(
+    env: Env,
+    deps: DepsMut,
+    info: MessageInfo,
+    id: Uint128,
+) -> Result<Response, ContractError> {
+    let mut stream = STREAMS.load(deps.storage, id.u128().into())?;
+    if stream.recipient != info.sender {
+        return Err(ContractError::NotStreamRecipient {});
+    }
+
+    if stream.claimed_amount >= stream.amount {
+        return Err(ContractError::StreamFullyClaimed {});
+    }
+
+    let block_time = env.block.time.seconds();
+    if stream.start_time >= block_time {
+        return Err(ContractError::StreamNotStarted {});
+    }
+
+    let unclaimed_amount = u128::from(block_time)
+        .checked_sub(stream.start_time.into())
+        .unwrap()
+        .checked_mul(stream.rate_per_second.u128())
+        .unwrap()
+        .checked_sub(stream.claimed_amount.u128())
+        .unwrap();
+
+    stream.claimed_amount = stream
+        .claimed_amount
+        .u128()
+        .checked_add(unclaimed_amount)
+        .unwrap()
+        .into();
+
+    STREAMS.save(deps.storage, id.u128().into(), &stream)?;
+
+    let config = CONFIG.load(deps.storage)?;
+    let cw20 = Cw20Contract(config.cw20_addr);
+    let msg = cw20.call(Cw20ExecuteMsg::Transfer {
+        recipient: stream.recipient.to_string(),
+        amount: unclaimed_amount.into(),
+    })?;
+
+    let res = Response::new()
+        .add_attribute("method", "try_withdraw")
+        .add_attribute("stream_id", id)
+        .add_attribute("amount", Uint128::from(unclaimed_amount))
+        .add_attribute("recipient", stream.recipient.to_string())
+        .add_message(msg);
+    Ok(res)
+}
+
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
@@ -203,6 +224,7 @@ fn query_stream(deps: Deps, id: Uint128) -> StdResult<StreamResponse> {
         recipient: stream.recipient.into_string(),
         amount: stream.amount,
         claimed_amount: stream.claimed_amount,
+        rate_per_second: stream.rate_per_second,
         start_time: stream.start_time,
         end_time: stream.end_time,
     })
@@ -212,42 +234,48 @@ fn query_stream(deps: Deps, id: Uint128) -> StdResult<StreamResponse> {
 mod tests {
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info, MOCK_CONTRACT_ADDR};
-    use cosmwasm_std::{attr, Addr};
+    use cosmwasm_std::{Addr, CosmosMsg, WasmMsg};
 
     #[test]
     fn initialization() {
         let mut deps = mock_dependencies();
-
         let msg = InstantiateMsg {
             owner: None,
             cw20_addr: String::from(MOCK_CONTRACT_ADDR),
         };
-        let info = mock_info("creator", &[]);
 
-        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
-        assert_eq!(_res.attributes[0], attr("method", "instantiate"));
-        assert_eq!(_res.attributes[1], attr("owner", "creator"));
+        let info = mock_info("creator", &[]);
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+
+        let msg = QueryMsg::GetConfig {};
+        let res = query(deps.as_ref(), mock_env(), msg).unwrap();
+        let config: Config = from_binary(&res).unwrap();
+
         assert_eq!(
-            _res.attributes[2],
-            attr("cw20_addr", String::from(MOCK_CONTRACT_ADDR))
+            config,
+            Config {
+                owner: Addr::unchecked("creator"),
+                cw20_addr: Addr::unchecked(MOCK_CONTRACT_ADDR)
+            }
         );
     }
 
     #[test]
-    fn create_stream() {
+    fn try_withdraw() {
         let mut deps = mock_dependencies();
         let msg = InstantiateMsg {
             owner: None,
             cw20_addr: String::from(MOCK_CONTRACT_ADDR),
         };
-        let mut info = mock_info("Alice", &[]);
-        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+        let mut info = mock_info(MOCK_CONTRACT_ADDR, &[]);
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
 
         let sender = Addr::unchecked("Alice").to_string();
         let recipient = Addr::unchecked("Bob").to_string();
-        let amount = Uint128::new(100);
-        let start_time = mock_env().block.time.plus_seconds(10000).nanos() / 1_000_000;
-        let end_time = mock_env().block.time.plus_seconds(15000).nanos() / 1_000_000;
+        let amount = Uint128::new(200);
+        let mut env = mock_env();
+        let start_time = env.block.time.plus_seconds(100).seconds();
+        let end_time = env.block.time.plus_seconds(300).seconds();
 
         let msg = ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender: sender.clone(),
@@ -259,17 +287,47 @@ mod tests {
             })
             .unwrap(),
         });
-        info.sender = Addr::unchecked(MOCK_CONTRACT_ADDR);
-        let res = execute(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
-        assert_eq!(res.attributes[0], attr("method", "try_create_stream"));
-        assert_eq!(res.attributes[1], attr("owner", sender));
-        assert_eq!(res.attributes[2], attr("recipient", recipient));
-        assert_eq!(res.attributes[3], attr("amount", amount));
+        execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+
+        let msg = QueryMsg::GetStream {
+            id: Uint128::new(1),
+        };
+        let res = query(deps.as_ref(), mock_env(), msg).unwrap();
+        let stream: Stream = from_binary(&res).unwrap();
+
         assert_eq!(
-            res.attributes[4],
-            attr("start_time", start_time.to_string())
+            stream,
+            Stream {
+                owner: Addr::unchecked("Alice"),
+                recipient: Addr::unchecked("Bob"),
+                amount: amount.clone(),
+                claimed_amount: Uint128::new(0),
+                start_time: start_time.clone(),
+                rate_per_second: Uint128::new(1),
+                end_time: end_time.clone()
+            }
         );
-        assert_eq!(res.attributes[5], attr("end_time", end_time.to_string()));
+
+        let msg = ExecuteMsg::Withdraw {
+            id: Uint128::new(1),
+        };
+        info.sender = Addr::unchecked("Bob");
+        env.block.time = env.block.time.plus_seconds(150);
+        let res = execute(deps.as_mut(), env.clone(), info.clone(), msg).unwrap();
+        let msg = res.messages[0].clone().msg;
+
+        assert_eq!(
+            msg,
+            CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: String::from(MOCK_CONTRACT_ADDR),
+                msg: to_binary(&Cw20ExecuteMsg::Transfer {
+                    recipient: String::from("Bob"),
+                    amount: Uint128::new(50)
+                })
+                .unwrap(),
+                funds: vec![]
+            })
+        );
 
         let msg = QueryMsg::GetStream {
             id: Uint128::new(1),
@@ -282,8 +340,9 @@ mod tests {
                 owner: Addr::unchecked("Alice"),
                 recipient: Addr::unchecked("Bob"),
                 amount: amount.clone(),
-                claimed_amount: Uint128::new(0),
+                claimed_amount: Uint128::new(50),
                 start_time: start_time.clone(),
+                rate_per_second: Uint128::new(1),
                 end_time: end_time.clone()
             }
         );
@@ -298,13 +357,13 @@ mod tests {
             cw20_addr: String::from(MOCK_CONTRACT_ADDR),
         };
         let mut info = mock_info("Alice", &[]);
-        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
 
         let sender = Addr::unchecked("Alice").to_string();
         let recipient = Addr::unchecked("Bob").to_string();
         let amount = Uint128::new(100);
-        let start_time = mock_env().block.time.plus_seconds(10000).nanos() / 1_000_000;
-        let end_time = mock_env().block.time.plus_seconds(2000).nanos() / 1_000_000;
+        let start_time = mock_env().block.time.plus_seconds(100).seconds();
+        let end_time = mock_env().block.time.plus_seconds(20).seconds();
 
         let msg = ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender: sender.clone(),
@@ -318,7 +377,6 @@ mod tests {
         });
         info.sender = Addr::unchecked(MOCK_CONTRACT_ADDR);
         let err = execute(deps.as_mut(), mock_env(), info.clone(), msg).unwrap_err();
-
         match err {
             ContractError::InvalidStartTime {} => {}
             e => panic!("unexpected error: {}", e),
@@ -334,13 +392,13 @@ mod tests {
             cw20_addr: String::from(MOCK_CONTRACT_ADDR),
         };
         let mut info = mock_info("Alice", &[]);
-        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
 
         let sender = Addr::unchecked("Alice").to_string();
         let recipient = Addr::unchecked("Bob").to_string();
         let amount = Uint128::new(100);
-        let start_time = mock_env().block.time.plus_seconds(10000).nanos() / 1_000_000;
-        let end_time = mock_env().block.time.plus_seconds(2000).nanos() / 1_000_000;
+        let start_time = mock_env().block.time.plus_seconds(100).seconds();
+        let end_time = mock_env().block.time.plus_seconds(200).seconds();
 
         let msg = ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender: sender.clone(),
@@ -362,20 +420,21 @@ mod tests {
     }
 
     #[test]
-    fn withdraw() {
+    fn invalid_deposit_amount() {
         let mut deps = mock_dependencies();
+
         let msg = InstantiateMsg {
             owner: None,
             cw20_addr: String::from(MOCK_CONTRACT_ADDR),
         };
         let mut info = mock_info("Alice", &[]);
-        let _res = instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
+        instantiate(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
 
         let sender = Addr::unchecked("Alice").to_string();
         let recipient = Addr::unchecked("Bob").to_string();
-        let amount = Uint128::new(100);
-        let start_time = mock_env().block.time.nanos() / 1_000_000;
-        let end_time = mock_env().block.time.plus_seconds(15000).nanos() / 1_000_000;
+        let amount = Uint128::new(3);
+        let start_time = mock_env().block.time.plus_seconds(100).seconds();
+        let end_time = mock_env().block.time.plus_seconds(200).seconds();
 
         let msg = ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender: sender.clone(),
@@ -388,43 +447,11 @@ mod tests {
             .unwrap(),
         });
         info.sender = Addr::unchecked(MOCK_CONTRACT_ADDR);
-        let res = execute(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
-        assert_eq!(res.attributes[0], attr("method", "try_create_stream"));
-        assert_eq!(res.attributes[1], attr("owner", sender));
-        assert_eq!(res.attributes[2], attr("recipient", recipient));
-        assert_eq!(res.attributes[3], attr("amount", amount));
-        assert_eq!(
-            res.attributes[4],
-            attr("start_time", start_time.to_string())
-        );
-        assert_eq!(res.attributes[5], attr("end_time", end_time.to_string()));
+        let err = execute(deps.as_mut(), mock_env(), info.clone(), msg).unwrap_err();
 
-        let msg = QueryMsg::GetStream {
-            id: Uint128::new(1),
-        };
-        let res = query(deps.as_ref(), mock_env(), msg).unwrap();
-        let stream: Stream = from_binary(&res).unwrap();
-        assert_eq!(
-            stream,
-            Stream {
-                owner: Addr::unchecked("Alice"),
-                recipient: Addr::unchecked("Bob"),
-                amount: amount.clone(),
-                claimed_amount: Uint128::new(0),
-                start_time: start_time.clone(),
-                end_time: end_time.clone()
-            }
-        );
-
-        let msg = ExecuteMsg::Withdraw {
-            id: Uint128::new(1),
-        };
-
-        info.sender = Addr::unchecked("Bob");
-        let res = execute(deps.as_mut(), mock_env(), info.clone(), msg).unwrap();
-        assert_eq!(res.attributes[0], attr("method", "withdraw"));
-        assert_eq!(res.attributes[1], attr("stream_id", Uint128::new(1)));
-        // TODO: Assertion for claimed amount
-        assert_eq!(res.attributes[3], attr("recipient", Addr::unchecked("Bob")));
+        // TODO: More specific error for invalid deposit amount
+        match err {
+            _e => {}
+        }
     }
 }

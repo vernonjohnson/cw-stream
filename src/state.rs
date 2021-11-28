@@ -20,6 +20,7 @@ pub struct Stream {
     pub claimed_amount: Uint128,
     pub start_time: u64,
     pub end_time: u64,
+    pub rate_per_second: Uint128,
 }
 
 pub const STREAM_SEQ: Item<Uint128> = Item::new("stream_seq");
