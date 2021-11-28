@@ -26,4 +26,13 @@ pub enum ContractError {
 
     #[error("StreamNotFound")]
     StreamNotFound {},
+
+    #[error("InvalidDuration")]
+    InvalidDuration {},
+
+    #[error("InvalidOwner")]
+    InvalidOwner {},
+
+    #[error("InvalidRecipient")]
+    InvalidRecipient {},
 }
