@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ReceiveMsg",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "create_stream"
+      ],
+      "properties": {
+        "create_stream": {
+          "type": "object",
+          "required": [
+            "end_time",
+            "recipient",
+            "start_time"
+          ],
+          "properties": {
+            "end_time": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "recipient": {
+              "type": "string"
+            },
+            "start_time": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

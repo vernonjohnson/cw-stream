@@ -41,4 +41,3 @@ To lint repo run:
 cargo fmt
 ```
 
-
