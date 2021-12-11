@@ -1,19 +1,17 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "InstantiateMsg",
+  "title": "ConfigResponse",
   "type": "object",
   "required": [
-    "cw20_addr"
+    "cw20_addr",
+    "owner"
   ],
   "properties": {
     "cw20_addr": {
       "type": "string"
     },
     "owner": {
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string"
     }
   }
 }
